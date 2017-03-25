@@ -4,29 +4,26 @@ Classes that are LLVM types
 
 from __future__ import print_function, absolute_import
 
-# XXX This doesn't seem to be used
-_type_state = iter(range(50))
-_type_enum = lambda: next(_type_state)
+import struct
 
-TYPE_UNKNOWN = _type_enum()
-TYPE_POINTER = _type_enum()
-TYPE_STRUCT = _type_enum()
-TYPE_METADATA = _type_enum()
+from ._utils import _StrCaching
 
 
-class Type(object):
+def _wrapname(x):
+    return '"{0}"'.format(x.replace('\\', '\\5c').replace('"', '\\22'))
+
+
+class Type(_StrCaching):
     """
     The base class for all LLVM types.
     """
     is_pointer = False
     null = 'zeroinitializer'
 
-    kind = TYPE_UNKNOWN
-
     def __repr__(self):
         return "<%s %s>" % (type(self), str(self))
 
-    def __str__(self):
+    def _to_string(self):
         raise NotImplementedError
 
     def as_pointer(self, addrspace=0):
@@ -35,29 +32,71 @@ class Type(object):
     def __ne__(self, other):
         return not (self == other)
 
-    def get_abi_size(self, target_data):
+    def _get_ll_pointer_type(self, target_data, context=None):
         """
-        Get the ABI size of this type according to data layout *target_data*.
+        Convert this type object to an LLVM type.
         """
         from . import Module, GlobalVariable
         from ..binding import parse_assembly
 
-        # We need to convert our type object to an LLVM type
-        m = Module()
+        if context is None:
+            m = Module()
+        else:
+            m = Module(context=context)
         foo = GlobalVariable(m, self, name="foo")
         with parse_assembly(str(m)) as llmod:
-            llty = llmod.get_global_variable(foo.name).type
-            return target_data.get_pointee_abi_size(llty)
+            return llmod.get_global_variable(foo.name).type
+
+    def get_abi_size(self, target_data, context=None):
+        """
+        Get the ABI size of this type according to data layout *target_data*.
+        """
+        llty = self._get_ll_pointer_type(target_data, context)
+        return target_data.get_pointee_abi_size(llty)
+
+    def get_abi_alignment(self, target_data, context=None):
+        """
+        Get the minimum ABI alignment of this type according to data layout
+        *target_data*.
+        """
+        llty = self._get_ll_pointer_type(target_data, context)
+        return target_data.get_pointee_abi_alignment(llty)
+
+    def format_constant(self, value):
+        """
+        Format constant *value* of this type.  This method may be overriden
+        by subclasses.
+        """
+        return str(value)
+
+    def wrap_constant_value(self, value):
+        """
+        Wrap constant *value* if necessary.  This method may be overriden
+        by subclasses (especially aggregate types).
+        """
+        return value
+
+    def __call__(self, value):
+        """
+        Create a LLVM constant of this type with the given Python value.
+        """
+        from . import Constant
+        return Constant(self, value)
 
 
-class MetaData(Type):
-    kind = TYPE_METADATA
+class MetaDataType(Type):
 
-    def __str__(self):
+    def _to_string(self):
         return "metadata"
 
     def as_pointer(self):
         raise TypeError
+
+    def __eq__(self, other):
+        return isinstance(other, MetaDataType)
+
+    def __hash__(self):
+        return hash(MetaDataType)
 
 
 class LabelType(Type):
@@ -65,7 +104,7 @@ class LabelType(Type):
     The label type is the type of e.g. basic blocks.
     """
 
-    def __str__(self):
+    def _to_string(self):
         return "label"
 
 
@@ -74,7 +113,6 @@ class PointerType(Type):
     The type of all pointer values.
     """
     is_pointer = True
-    kind = TYPE_POINTER
     null = 'null'
 
     def __init__(self, pointee, addrspace=0):
@@ -82,7 +120,7 @@ class PointerType(Type):
         self.pointee = pointee
         self.addrspace = addrspace
 
-    def __str__(self):
+    def _to_string(self):
         if self.addrspace != 0:
             return "{0} addrspace({1})* ".format(self.pointee, self.addrspace)
         else:
@@ -90,9 +128,13 @@ class PointerType(Type):
 
     def __eq__(self, other):
         if isinstance(other, PointerType):
-            return self.pointee == other.pointee
+            return (self.pointee, self.addrspace) == (other.pointee,
+                                                      other.addrspace)
         else:
             return False
+
+    def __hash__(self):
+        return hash(PointerType)
 
     def gep(self, i):
         """
@@ -102,17 +144,24 @@ class PointerType(Type):
             raise TypeError(i.type)
         return self.pointee
 
+    @property
+    def intrinsic_name(self):
+        return 'p%d%s' % (self.addrspace, self.pointee.intrinsic_name)
+
 
 class VoidType(Type):
     """
     The type for empty values (e.g. a function returning no value).
     """
 
-    def __str__(self):
+    def _to_string(self):
         return 'void'
 
     def __eq__(self, other):
         return isinstance(other, VoidType)
+
+    def __hash__(self):
+        return hash(VoidType)
 
 
 class FunctionType(Type):
@@ -125,9 +174,9 @@ class FunctionType(Type):
         self.args = tuple(args)
         self.var_arg = var_arg
 
-    def __str__(self):
+    def _to_string(self):
         if self.args:
-            strargs = ', '.join(str(a) for a in self.args)
+            strargs = ', '.join([str(a) for a in self.args])
             if self.var_arg:
                 return '{0} ({1}, ...)'.format(self.return_type, strargs)
             else:
@@ -144,18 +193,41 @@ class FunctionType(Type):
         else:
             return False
 
+    def __hash__(self):
+        return hash(FunctionType)
+
 
 class IntType(Type):
     """
     The type for integers.
     """
     null = '0'
+    _instance_cache = {}
 
-    def __init__(self, bits):
-        assert isinstance(bits, int)
+    def __new__(cls, bits):
+        # Cache all common integer types
+        if 0 <= bits <= 128:
+            try:
+                return cls._instance_cache[bits]
+            except KeyError:
+                inst = cls._instance_cache[bits] = cls.__new(bits)
+                return inst
+        return cls.__new(bits)
+
+    @classmethod
+    def __new(cls, bits):
+        assert isinstance(bits, int) and bits >= 0
+        self = super(IntType, cls).__new__(cls)
         self.width = bits
+        return self
 
-    def __str__(self):
+    def __getnewargs__(self):
+        return self.width,
+
+    def __copy__(self):
+        return self
+
+    def _to_string(self):
         return 'i%u' % (self.width,)
 
     def __eq__(self, other):
@@ -164,8 +236,57 @@ class IntType(Type):
         else:
             return False
 
+    def __hash__(self):
+        return hash(IntType)
 
-class FloatType(Type):
+    def format_constant(self, val):
+        if isinstance(val, bool):
+            return str(val).lower()
+        else:
+            return str(val)
+
+    @property
+    def intrinsic_name(self):
+        return str(self)
+
+
+def _as_float(value):
+    """
+    Truncate to single-precision float.
+    """
+    return struct.unpack('f', struct.pack('f', value))[0]
+
+def _format_float_as_hex(value, packfmt, unpackfmt, numdigits):
+    raw = struct.pack(packfmt, float(value))
+    intrep = struct.unpack(unpackfmt, raw)[0]
+    out = '{{0:#{0}x}}'.format(numdigits).format(intrep)
+    return out
+
+def _format_double(value):
+    """
+    Format *value* as a hexadecimal string of its IEEE double precision
+    representation.
+    """
+    return _format_float_as_hex(value, 'd', 'Q', 16)
+
+
+class _BaseFloatType(Type):
+
+    def __new__(cls):
+        return cls._instance_cache
+
+    def __eq__(self, other):
+        return isinstance(other, type(self))
+
+    def __hash__(self):
+        return hash(type(self))
+
+    @classmethod
+    def _create_instance(cls):
+        cls._instance_cache = super(_BaseFloatType, cls).__new__(cls)
+
+
+class FloatType(_BaseFloatType):
     """
     The type for single-precision floats.
     """
@@ -175,11 +296,11 @@ class FloatType(Type):
     def __str__(self):
         return 'float'
 
-    def __eq__(self, other):
-        return isinstance(other, type(self))
+    def format_constant(self, value):
+        return _format_double(_as_float(value))
 
 
-class DoubleType(Type):
+class DoubleType(_BaseFloatType):
     """
     The type for double-precision floats.
     """
@@ -189,8 +310,12 @@ class DoubleType(Type):
     def __str__(self):
         return 'double'
 
-    def __eq__(self, other):
-        return isinstance(other, type(self))
+    def format_constant(self, value):
+        return _format_double(value)
+
+
+for _cls in (FloatType, DoubleType):
+    _cls._create_instance()
 
 
 class _Repeat(object):
@@ -214,6 +339,17 @@ class Aggregate(Type):
     See http://llvm.org/docs/LangRef.html#t-aggregate
     """
 
+    def wrap_constant_value(self, values):
+        from . import Value, Constant
+
+        if not isinstance(values, (list, tuple)):
+            return values
+        if len(values) != len(self):
+            raise ValueError("wrong constant size for %s: got %d elements"
+                             % (self, len(values)))
+        return [Constant(ty, val) if not isinstance(val, Value) else val
+                for ty, val in zip(self.elements, values)]
+
 
 class ArrayType(Aggregate):
     """
@@ -231,12 +367,15 @@ class ArrayType(Aggregate):
     def __len__(self):
         return self.count
 
-    def __str__(self):
-        return '[{0:d} x {1}]'.format(self.count, self.element)
+    def _to_string(self):
+        return "[%d x %s]" % (self.count, self.element)
 
     def __eq__(self, other):
         if isinstance(other, ArrayType):
             return self.element == other.element and self.count == other.count
+
+    def __hash__(self):
+        return hash(ArrayType)
 
     def gep(self, i):
         """
@@ -246,44 +385,39 @@ class ArrayType(Aggregate):
             raise TypeError(i.type)
         return self.element
 
+    def format_constant(self, value):
+        itemstring = ", " .join(["{0} {1}".format(x.type, x.get_reference())
+                                 for x in value])
+        return "[{0}]".format(itemstring)
+
 
 class BaseStructType(Aggregate):
     """
     The base type for heterogenous struct types.
     """
 
-    kind = TYPE_STRUCT
-
     def __len__(self):
-        assert not self.is_opaque
+        assert self.elements is not None
         return len(self.elements)
 
     def __iter__(self):
-        assert not self.is_opaque
+        assert self.elements is not None
         return iter(self.elements)
 
     @property
     def is_opaque(self):
         return self.elements is None
 
+    def structure_repr(self):
+        """
+        Return the LLVM IR for the structure representation
+        """
+        return '{%s}' % ', '.join([str(x) for x in self.elements])
 
-class LiteralStructType(BaseStructType):
-    """
-    The type of "literal" structs, i.e. structs with a literally-defined
-    type (by contrast with IdentifiedStructType).
-    """
-
-    null = 'zeroinitializer'
-
-    def __init__(self, elems):
-        self.elements = tuple(elems)
-
-    def __str__(self):
-        return '{%s}' % ', '.join(map(str, self.elements))
-
-    def __eq__(self, other):
-        if isinstance(other, LiteralStructType):
-            return self.elements == other.elements
+    def format_constant(self, value):
+        itemstring = ", " .join(["{0} {1}".format(x.type, x.get_reference())
+                                 for x in value])
+        return "{{{0}}}".format(itemstring)
 
     def gep(self, i):
         """
@@ -297,6 +431,28 @@ class LiteralStructType(BaseStructType):
         return self.elements[i.constant]
 
 
+class LiteralStructType(BaseStructType):
+    """
+    The type of "literal" structs, i.e. structs with a literally-defined
+    type (by contrast with IdentifiedStructType).
+    """
+
+    null = 'zeroinitializer'
+
+    def __init__(self, elems):
+        self.elements = tuple(elems)
+
+    def _to_string(self):
+        return self.structure_repr()
+
+    def __eq__(self, other):
+        if isinstance(other, LiteralStructType):
+            return self.elements == other.elements
+
+    def __hash__(self):
+        return hash(LiteralStructType)
+
+
 class IdentifiedStructType(BaseStructType):
     """
     A type which is a named alias for another struct type, akin to a typedef.
@@ -305,6 +461,7 @@ class IdentifiedStructType(BaseStructType):
 
     Do not use this directly.
     """
+    null = 'zeroinitializer'
 
     def __init__(self, context, name):
         assert name
@@ -312,9 +469,29 @@ class IdentifiedStructType(BaseStructType):
         self.name = name
         self.elements = None
 
-    def __str__(self):
-        return self.name
+    def _to_string(self):
+        return "%{name}".format(name=_wrapname(self.name))
+
+    def get_declaration(self):
+        """
+        Returns the string for the declaration of the type
+        """
+        if self.is_opaque:
+            out = "{strrep} = type opaque".format(strrep=str(self))
+        else:
+            out = "{strrep} = type {struct}".format(
+                strrep=str(self), struct=self.structure_repr())
+        return out
 
     def __eq__(self, other):
         if isinstance(other, IdentifiedStructType):
             return self.name == other.name
+
+    def __hash__(self):
+        return hash(IdentifiedStructType)
+
+    def set_body(self, *elems):
+        if not self.is_opaque:
+            raise RuntimeError("{name} is already defined".format(
+                name=self.name))
+        self.elements = tuple(elems)

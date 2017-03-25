@@ -4,39 +4,39 @@ Implementation of LLVM IR instructions.
 
 from __future__ import print_function, absolute_import
 
-from . import types, _utils
-from .values import Block, ConstOpMixin, Undefined, Value
+from . import types
+from .values import (Block, Function, Value, NamedValue, Constant,
+                     MetaDataArgument, MetaDataString, AttributeSet)
+from ._utils import _HasMetadata
 
 
-class Instruction(Value):
-    def __init__(self, parent, typ, opname, operands, name=''):
+class Instruction(NamedValue, _HasMetadata):
+    def __init__(self, parent, typ, opname, operands, name='', flags=()):
         super(Instruction, self).__init__(parent, typ, name=name)
         assert isinstance(parent, Block)
+        assert isinstance(flags, (tuple, list))
         self.opname = opname
         self.operands = operands
-
+        self.flags = list(flags)
         self.metadata = {}
 
-    def _stringify_metatdata(self):
-        buf = []
+    @property
+    def function(self):
+        return self.parent.function
 
-        if self.metadata:
-            for k, v in self.metadata.items():
-                buf.append("!{0} {1}".format(k, v.get_reference()))
-            return ', ' + ', '.join(buf)
-        else:
-            return ''
-
-    def set_metadata(self, name, node):
-        self.metadata[name] = node
+    @property
+    def module(self):
+        return self.parent.function.module
 
     def descr(self, buf):
         opname = self.opname
-        operands = ', '.join(op.get_reference() for op in self.operands)
+        if self.flags:
+            opname = ' '.join([opname] + self.flags)
+        operands = ', '.join([op.get_reference() for op in self.operands])
         typ = self.type
-        metadata = self._stringify_metatdata()
-        print("{opname} {typ} {operands}{metadata}".format(**locals()),
-              file=buf)
+        metadata = self._stringify_metadata(leading_comma=True)
+        buf.append("{0} {1} {2}{3}\n"
+                   .format(opname, typ, operands, metadata))
 
     def replace_usage(self, old, new):
         if old in self.operands:
@@ -45,9 +45,44 @@ class Instruction(Value):
                 ops.append(new if op is old else op)
             self.operands = tuple(ops)
 
+    def __repr__(self):
+        return "<ir.%s %r of type '%s', opname %r, operands %r>" % (
+            self.__class__.__name__, self.name, self.type,
+            self.opname, self.operands)
+
+
+class CallInstrAttributes(AttributeSet):
+    _known = frozenset(['noreturn', 'nounwind', 'readonly', 'readnone'])
+
+
+class FastMathFlags(AttributeSet):
+    _known = frozenset(['fast', 'nnan', 'ninf', 'nsz', 'arcp'])
+
 
 class CallInstr(Instruction):
-    def __init__(self, parent, func, args, name=''):
+    def __init__(self, parent, func, args, name='', cconv=None, tail=False,
+                 fastmath=()):
+        self.cconv = (func.calling_convention
+                      if cconv is None and isinstance(func, Function)
+                      else cconv)
+        self.tail = tail
+        self.fastmath = FastMathFlags(fastmath)
+        self.attributes = CallInstrAttributes()
+
+        # Fix and validate arguments
+        args = list(args)
+        for i in range(len(func.function_type.args)):
+            arg = args[i]
+            expected_type = func.function_type.args[i]
+            if (isinstance(expected_type, types.MetaDataType) and
+                arg.type != expected_type):
+                arg = MetaDataArgument(arg)
+            if arg.type != expected_type:
+                msg = ("Type of #{0} arg mismatch: {1} != {2}"
+                       .format(1 + i, expected_type, arg.type))
+                raise TypeError(msg)
+            args[i] = arg
+
         super(CallInstr, self).__init__(parent, func.function_type.return_type,
                                         "call", [func] + list(args), name=name)
 
@@ -73,31 +108,77 @@ class CallInstr(Instruction):
         """Alias for llvmpy"""
         return self.callee
 
+    def _descr(self, buf, add_metadata):
+        args = ', '.join(['{0} {1}'.format(a.type, a.get_reference())
+                          for a in self.args])
+
+        fnty = self.callee.function_type
+        # Only print function type if variable-argument
+        if fnty.var_arg:
+            ty = fnty
+        # Otherwise, just print the return type.
+        else:
+            # Fastmath flag work only in this case
+            ty = fnty.return_type
+        callee_ref = "{0} {1}".format(ty, self.callee.get_reference())
+        if self.cconv:
+            callee_ref = "{0} {1}".format(self.cconv, callee_ref)
+        buf.append("{tail}{op}{fastmath} {callee}({args}){attr}{meta}\n".format(
+            tail='tail ' if self.tail else '',
+            op=self.opname,
+            callee=callee_ref,
+            fastmath=''.join([" " + attr for attr in self.fastmath]),
+            args=args,
+            attr=''.join([" " + attr for attr in self.attributes]),
+            meta=(self._stringify_metadata(leading_comma=True)
+                  if add_metadata else ""),
+        ))
+
     def descr(self, buf):
-        args = ', '.join('{0} {1}'.format(a.type, a.get_reference())
-                         for a in self.args)
-        fnty = self.callee.type
-        print("call {0} {1}({2}){metadata}".format(
-            fnty,
-            self.callee.get_reference(),
-            args,
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        self._descr(buf, add_metadata=True)
+
+
+class InvokeInstr(CallInstr):
+    def __init__(self, parent, func, args, normal_to, unwind_to, name='', cconv=None):
+        assert isinstance(normal_to, Block)
+        assert isinstance(unwind_to, Block)
+        super(InvokeInstr, self).__init__(parent, func, args, name, cconv)
+        self.opname = "invoke"
+        self.normal_to = normal_to
+        self.unwind_to = unwind_to
+
+    def descr(self, buf):
+        super(InvokeInstr, self)._descr(buf, add_metadata=False)
+        buf.append("      to label {0} unwind label {1}{metadata}\n".format(
+            self.normal_to.get_reference(),
+            self.unwind_to.get_reference(),
+            metadata=self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class Terminator(Instruction):
     def __init__(self, parent, opname, operands):
         super(Terminator, self).__init__(parent, types.VoidType(), opname,
                                          operands)
-        self.metadata = {}
 
     def descr(self, buf):
         opname = self.opname
-        operands = ', '.join("{0} {1}".format(op.type, op.get_reference())
-                             for op in self.operands)
-        metadata = self._stringify_metatdata()
-        print("{opname} {operands} {metadata}".format(**locals()), file=buf,
-              end='')
+        operands = ', '.join(["{0} {1}".format(op.type, op.get_reference())
+                              for op in self.operands])
+        metadata = self._stringify_metadata(leading_comma=True)
+        buf.append("{0} {1}{2}".format(opname, operands, metadata))
+
+
+class PredictableInstr(Instruction):
+
+    def set_weights(self, weights):
+        operands = [MetaDataString(self.module, "branch_weights")]
+        for w in weights:
+            if w < 0:
+                raise ValueError("branch weight must be a positive integer")
+            operands.append(Constant(types.IntType(32), w))
+        md = self.module.add_metadata(operands)
+        self.set_metadata("prof", md)
 
 
 class Ret(Terminator):
@@ -114,15 +195,50 @@ class Ret(Terminator):
 
     def descr(self, buf):
         return_value = self.return_value
+        metadata = self._stringify_metadata(leading_comma=True)
         if return_value is not None:
-            msg = "{0} {1} {2}".format(self.opname, return_value.type,
-                                       return_value.get_reference())
+            buf.append("{0} {1} {2}{3}\n"
+                       .format(self.opname, return_value.type,
+                               return_value.get_reference(),
+                               metadata))
         else:
-            msg = str(self.opname)
-        print(msg, file=buf)
+            buf.append("{0}{1}\n".format(self.opname, metadata))
 
 
-class SwitchInstr(Terminator):
+class Branch(Terminator):
+    pass
+
+
+class ConditionalBranch(PredictableInstr, Terminator):
+    pass
+
+
+class IndirectBranch(PredictableInstr, Terminator):
+    def __init__(self, parent, opname, addr):
+        super(IndirectBranch, self).__init__(parent, opname, [addr])
+        self.destinations = []
+
+    @property
+    def address(self):
+        return self.operands[0]
+
+    def add_destination(self, block):
+        assert isinstance(block, Block)
+        self.destinations.append(block)
+
+    def descr(self, buf):
+        destinations = ["label {0}".format(blk.get_reference())
+                        for blk in self.destinations]
+        buf.append("indirectbr {0} {1}, [{2}]  {3}\n".format(
+            self.address.type,
+            self.address.get_reference(),
+            ', '.join(destinations),
+            self._stringify_metadata(leading_comma=True),
+            ))
+
+
+class SwitchInstr(PredictableInstr, Terminator):
+
     def __init__(self, parent, opname, val, default):
         super(SwitchInstr, self).__init__(parent, opname, [val])
         self.default = default
@@ -132,21 +248,27 @@ class SwitchInstr(Terminator):
     def value(self):
         return self.operands[0]
 
-    def add_case(self, val, blk):
-        assert isinstance(blk, Block)
-        self.cases.append((val, blk))
+    def add_case(self, val, block):
+        assert isinstance(block, Block)
+        if not isinstance(val, Value):
+            val = Constant(self.value.type, val)
+        self.cases.append((val, block))
 
     def descr(self, buf):
         cases = ["{0} {1}, label {2}".format(val.type, val.get_reference(),
                                              blk.get_reference())
                  for val, blk in self.cases]
-        print("switch {0} {1}, label {2} [{3}]  {metadata}".format(
+        buf.append("switch {0} {1}, label {2} [{3}]  {4}\n".format(
             self.value.type,
             self.value.get_reference(),
             self.default.get_reference(),
             ' '.join(cases),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+            self._stringify_metadata(leading_comma=True),
+            ))
+
+
+class Resume(Terminator):
+    pass
 
 
 class SelectInstr(Instruction):
@@ -168,12 +290,12 @@ class SelectInstr(Instruction):
         return self.operands[2]
 
     def descr(self, buf):
-        print("select {0} {1}, {2} {3}, {4} {5} {metadata}".format(
+        buf.append("select {0} {1}, {2} {3}, {4} {5} {6}\n".format(
             self.cond.type, self.cond.get_reference(),
             self.lhs.type, self.lhs.get_reference(),
             self.rhs.type, self.rhs.get_reference(),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+            self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class CompareInstr(Instruction):
@@ -181,22 +303,28 @@ class CompareInstr(Instruction):
     OPNAME = 'invalid-compare'
     VALID_OP = {}
 
-    def __init__(self, parent, op, lhs, rhs, name=''):
+    def __init__(self, parent, op, lhs, rhs, name='', flags=[]):
         if op not in self.VALID_OP:
             raise ValueError("invalid comparison %r for %s" % (op, self.OPNAME))
+        for flag in flags:
+            if flag not in self.VALID_FLAG:
+                raise ValueError("invalid flag %r for %s" % (flag, self.OPNAME))
+        opname = self.OPNAME
         super(CompareInstr, self).__init__(parent, types.IntType(1),
-                                           self.OPNAME, [lhs, rhs], name=name)
+                                           opname, [lhs, rhs], flags=flags,
+                                           name=name)
         self.op = op
 
     def descr(self, buf):
-        print("{0} {1} {2} {3}, {4}{metadata}".format(
-            self.OPNAME,
-            self.op,
-            self.operands[0].type,
-            self.operands[0].get_reference(),
-            self.operands[1].get_reference(),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        buf.append("{opname}{flags} {op} {ty} {lhs}, {rhs} {meta}\n".format(
+            opname=self.opname,
+            flags=''.join(' ' + it for it in self.flags),
+            op=self.op,
+            ty=self.operands[0].type,
+            lhs=self.operands[0].get_reference(),
+            rhs=self.operands[1].get_reference(),
+            meta=self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class ICMPInstr(CompareInstr):
@@ -213,6 +341,7 @@ class ICMPInstr(CompareInstr):
         'slt': 'signed less than',
         'sle': 'signed less or equal',
     }
+    VALID_FLAG = set()
 
 
 class FCMPInstr(CompareInstr):
@@ -235,6 +364,7 @@ class FCMPInstr(CompareInstr):
         'uno': 'unordered (either nans)',
         'true': 'no comparison, always returns true',
     }
+    VALID_FLAG = {'nnan', 'ninf', 'nsz', 'arcp', 'fast'}
 
 
 class CastInstr(Instruction):
@@ -242,26 +372,35 @@ class CastInstr(Instruction):
         super(CastInstr, self).__init__(parent, typ, op, [val], name=name)
 
     def descr(self, buf):
-        print("{0} {1} {2} to {3}{metadata}".format(
+        buf.append("{0} {1} {2} to {3} {4}\n".format(
             self.opname,
             self.operands[0].type,
             self.operands[0].get_reference(),
             self.type,
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+            self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class LoadInstr(Instruction):
+
     def __init__(self, parent, ptr, name=''):
         super(LoadInstr, self).__init__(parent, ptr.type.pointee, "load",
                                         [ptr], name=name)
+        self.align = None
 
     def descr(self, buf):
         [val] = self.operands
-        print("load {0} {1}{metadata}".format(
-            val.type, val.get_reference(),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        if self.align is not None:
+            align = ', align %d' % (self.align)
+        else:
+            align = ''
+        buf.append("load {0}, {1} {2}{3}{4}\n".format(
+            val.type.pointee,
+            val.type,
+            val.get_reference(),
+            align,
+            self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class StoreInstr(Instruction):
@@ -271,11 +410,18 @@ class StoreInstr(Instruction):
 
     def descr(self, buf):
         val, ptr = self.operands
-        print("store {0} {1}, {2} {3}{metadata}".format(
-            val.type, val.get_reference(),
-            ptr.type, ptr.get_reference(),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        if self.align is not None:
+            align = ', align %d' % (self.align)
+        else:
+            align = ''
+        buf.append("store {0} {1}, {2} {3}{4}{5}\n".format(
+            val.type,
+            val.get_reference(),
+            ptr.type,
+            ptr.get_reference(),
+            align,
+            self._stringify_metadata(leading_comma=True),
+            ))
 
 
 class AllocaInstr(Instruction):
@@ -283,26 +429,32 @@ class AllocaInstr(Instruction):
         operands = [count] if count else ()
         super(AllocaInstr, self).__init__(parent, typ.as_pointer(), "alloca",
                                           operands, name)
+        self.align = None
 
     def descr(self, buf):
-        print("{0} {1}".format(self.opname, self.type.pointee),
-              file=buf, end='')
+        buf.append("{0} {1}".format(self.opname, self.type.pointee))
         if self.operands:
-            print(", {0} {1}".format(
-                self.operands[0].type,
-                self.operands[0].get_reference(),
-                ), file=buf, end='')
+            op, = self.operands
+            buf.append(", {0} {1}".format(op.type, op.get_reference()))
+        if self.align is not None:
+            buf.append(", align {0}".format(self.align))
         if self.metadata:
-            print(self._stringify_metatdata(), file=buf)
+            buf.append(self._stringify_metadata(leading_comma=True))
 
 
 class GEPInstr(Instruction):
     def __init__(self, parent, ptr, indices, inbounds, name):
         typ = ptr.type
+        lasttyp = None
         for i in indices:
-            typ = typ.gep(i)
+            lasttyp, typ = typ, typ.gep(i)
 
-        typ = typ.as_pointer()
+        if (not isinstance(typ, types.PointerType) and
+                isinstance(lasttyp, types.PointerType)):
+            typ = lasttyp
+        else:
+            typ = typ.as_pointer()
+
         super(GEPInstr, self).__init__(parent, typ, "getelementptr",
                                        [ptr] + list(indices), name=name)
         self.pointer = ptr
@@ -312,14 +464,15 @@ class GEPInstr(Instruction):
     def descr(self, buf):
         indices = ['{0} {1}'.format(i.type, i.get_reference())
                    for i in self.indices]
-        head = "getelementptr inbounds" if self.inbounds else "getelementptr"
-        print("{0} {1} {2}, {3} {metadata}".format(
-                  head,
-                  self.pointer.type,
-                  self.pointer.get_reference(),
-                  ', '.join(indices),
-                  metadata=self._stringify_metatdata(),
-                  ), file=buf)
+        op = "getelementptr inbounds" if self.inbounds else "getelementptr"
+        buf.append("{0} {1}, {2} {3}, {4} {5}\n".format(
+                   op,
+                   self.pointer.type.pointee,
+                   self.pointer.type,
+                   self.pointer.get_reference(),
+                   ', '.join(indices),
+                   self._stringify_metadata(leading_comma=True),
+                   ))
 
 
 class PhiInstr(Instruction):
@@ -331,9 +484,11 @@ class PhiInstr(Instruction):
         incs = ', '.join('[{0}, {1}]'.format(v.get_reference(),
                                              b.get_reference())
                          for v, b in self.incomings)
-        print("phi {0} {1} {metadata}".format(
-            self.type, incs, metadata=self._stringify_metatdata(),
-            ), file=buf)
+        buf.append("phi {0} {1} {2}\n".format(
+                   self.type,
+                   incs,
+                   self._stringify_metadata(leading_comma=True),
+                   ))
 
     def add_incoming(self, value, block):
         assert isinstance(block, Block)
@@ -363,12 +518,12 @@ class ExtractValue(Instruction):
     def descr(self, buf):
         indices = [str(i) for i in self.indices]
 
-        print("extractvalue {0} {1}, {2} {metadata}".format(
-            self.aggregate.type,
-            self.aggregate.get_reference(),
-            ', '.join(indices),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        buf.append("extractvalue {0} {1}, {2} {3}\n".format(
+                   self.aggregate.type,
+                   self.aggregate.get_reference(),
+                   ', '.join(indices),
+                   self._stringify_metadata(leading_comma=True),
+                   ))
 
 
 class InsertValue(Instruction):
@@ -393,12 +548,12 @@ class InsertValue(Instruction):
     def descr(self, buf):
         indices = [str(i) for i in self.indices]
 
-        print("insertvalue {0} {1}, {2} {3}, {4} {metadata}".format(
-            self.aggregate.type, self.aggregate.get_reference(),
-            self.value.type, self.value.get_reference(),
-            ', '.join(indices),
-            metadata=self._stringify_metatdata(),
-            ), file=buf)
+        buf.append("insertvalue {0} {1}, {2} {3}, {4} {5}\n".format(
+                   self.aggregate.type, self.aggregate.get_reference(),
+                   self.value.type, self.value.get_reference(),
+                   ', '.join(indices),
+                   self._stringify_metadata(leading_comma=True),
+                   ))
 
 
 class Unreachable(Instruction):
@@ -407,7 +562,7 @@ class Unreachable(Instruction):
                                           "unreachable", (), name='')
 
     def descr(self, buf):
-        print(self.opname, file=buf)
+        buf += (self.opname, "\n")
 
 
 class InlineAsm(object):
@@ -420,15 +575,14 @@ class InlineAsm(object):
 
     def descr(self, buf):
         sideeffect = 'sideeffect' if self.side_effect else ''
-        fmt = "asm {sideeffect} \"{asm}\", \"{constraint}\""
-        print(fmt.format(sideeffect=sideeffect, asm=self.asm,
-                         constraint=self.constraint,),
-              file=buf, end='')
+        fmt = 'asm {sideeffect} "{asm}", "{constraint}"\n'
+        buf.append(fmt.format(sideeffect=sideeffect, asm=self.asm,
+                              constraint=self.constraint))
 
     def get_reference(self):
-        with _utils.StringIO() as buf:
-            self.descr(buf)
-            return buf.getvalue()
+        buf = []
+        self.descr(buf)
+        return "".join(buf)
 
     def __str__(self):
         return "{0} {1}".format(self.type, self.get_reference())
@@ -442,15 +596,16 @@ class AtomicRMW(Instruction):
         self.ordering = ordering
 
     def descr(self, buf):
-        fmt = "atomicrmw {op} {ptrty} {ptr}, {ty} {val} {ordering} {metadata}"
-        print(fmt.format(op=self.operation,
-                         ptrty=self.operands[0].type,
-                         ptr=self.operands[0].get_reference(),
-                         ty=self.operands[1].type,
-                         val=self.operands[1].get_reference(),
-                         ordering=self.ordering,
-                         metadata=self._stringify_metatdata(),),
-              file=buf)
+        ptr, val = self.operands
+        fmt = "atomicrmw {op} {ptrty} {ptr}, {valty} {val} {ordering} {metadata}\n"
+        buf.append(fmt.format(op=self.operation,
+                              ptrty=ptr.type,
+                              ptr=ptr.get_reference(),
+                              valty=val.type,
+                              val=val.get_reference(),
+                              ordering=self.ordering,
+                              metadata=self._stringify_metadata(leading_comma=True),
+                              ))
 
 
 class CmpXchg(Instruction):
@@ -465,14 +620,55 @@ class CmpXchg(Instruction):
         self.failordering = failordering
 
     def descr(self, buf):
+        ptr, cmpval, val = self.operands
         fmt = "cmpxchg {ptrty} {ptr}, {ty} {cmp}, {ty} {val} {ordering} " \
-              "{failordering} {metadata}"
-        print(fmt.format(ptrty=self.operands[0].type,
-                         ptr=self.operands[0].get_reference(),
-                         ty=self.operands[1].type,
-                         cmp=self.operands[1].get_reference(),
-                         val=self.operands[2].get_reference(),
-                         ordering=self.ordering,
-                         failordering=self.failordering,
-                         metadata=self._stringify_metatdata(), ),
-              file=buf)
+              "{failordering} {metadata}\n"
+        buf.append(fmt.format(ptrty=ptr.type,
+                              ptr=ptr.get_reference(),
+                              ty=cmpval.type,
+                              cmp=cmpval.get_reference(),
+                              val=val.get_reference(),
+                              ordering=self.ordering,
+                              failordering=self.failordering,
+                              metadata=self._stringify_metadata(leading_comma=True),
+                              ))
+
+
+class _LandingPadClause(object):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return "{kind} {type} {value}".format(
+            kind=self.kind,
+            type=self.value.type,
+            value=self.value.get_reference())
+
+class CatchClause(_LandingPadClause):
+    kind = 'catch'
+
+class FilterClause(_LandingPadClause):
+    kind = 'filter'
+
+    def __init__(self, value):
+        assert isinstance(value, Constant)
+        assert isinstance(value.type, types.ArrayType)
+        super(FilterClause, self).__init__(value)
+
+class LandingPadInstr(Instruction):
+    def __init__(self, parent, typ, name='', cleanup=False):
+        super(LandingPadInstr, self).__init__(parent, typ, "landingpad", [], name=name)
+        self.cleanup = cleanup
+        self.clauses = []
+
+    def add_clause(self, clause):
+        assert isinstance(clause, _LandingPadClause)
+        self.clauses.append(clause)
+
+    def descr(self, buf):
+        fmt = "landingpad {type}{cleanup}{clauses}\n"
+        buf.append(fmt.format(type=self.type,
+                              cleanup=' cleanup' if self.cleanup else '',
+                              clauses=''.join(["\n      {0}".format(clause)
+                                               for clause in self.clauses]),
+                              ))

@@ -6,84 +6,76 @@ Instructions are in the instructions module.
 from __future__ import print_function, absolute_import
 
 import string
-import struct
 
+from .. import six
 from . import types, _utils
+from ._utils import _StrCaching, _StringReferenceCaching, _HasMetadata
+
 
 _VALID_CHARS = (frozenset(map(ord, string.ascii_letters)) |
-                frozenset(map(ord, string.digits)))
+                frozenset(map(ord, string.digits)) |
+                frozenset(map(ord, ' !#$%&\'()*+,-./:;<=>?@[]^_`{|}~')))
 
 
-def _escape_string(text):
-    buf = []
-    for ch in text:
-        if ch in _VALID_CHARS:
-            buf.append(chr(ch))
-        else:
-            ashex = hex(ch)[2:]
-            if len(ashex) == 1:
-                ashex = '0' + ashex
-            buf.append('\\' + ashex)
+def _escape_string(text, _map={}):
+    """
+    Escape the given bytestring for safe use as a LLVM array constant.
+    """
+    if isinstance(text, str):
+        text = text.encode('ascii')
+    assert isinstance(text, (bytes, bytearray))
+
+    if not _map:
+        for ch in range(256):
+            if ch in _VALID_CHARS:
+                _map[ch] = chr(ch)
+            else:
+                _map[ch] = '\\%02x' % ch
+            if six.PY2:
+                _map[chr(ch)] = _map[ch]
+
+    buf = [_map[ch] for ch in text]
     return ''.join(buf)
 
 
-class Undefined(object):
-    pass
-
-
-def _wrapname(x):
-    return '"{0}"'.format(x).replace(' ', '_')
-
-
-def _as_float(value):
-    """Truncate to single-precision float
+class _ConstOpMixin(object):
     """
-    return struct.unpack('f', struct.pack('f', value))[0]
+    A mixin defining constant operations, for use in constant-like classes.
+    """
 
-
-def _format_float(value, packfmt, unpackfmt, numdigits):
-    raw = struct.pack(packfmt, float(value))
-    intrep = struct.unpack(unpackfmt, raw)[0]
-    out = '{{0:#{0}x}}'.format(numdigits).format(intrep)
-    return out
-
-
-def _special_float_value(val):
-    if val == val:
-        return val == float('+inf') or val == float('-inf')
-    return False
-
-
-class ConstOp(object):
-    def __init__(self, typ, op):
-        self.type = typ
-        self.op = op
-
-    def __str__(self):
-        return "{0}".format(self.op)
-
-    def get_reference(self):
-        return str(self)
-
-
-class ConstOpMixin(object):
     def bitcast(self, typ):
+        """
+        Bitcast this pointer constant to the given type.
+        """
         if typ == self.type:
             return self
         op = "bitcast ({0} {1} to {2})".format(self.type, self.get_reference(),
                                                typ)
-        return ConstOp(typ, op)
+        return FormattedConstant(typ, op)
 
     def inttoptr(self, typ):
-        assert isinstance(self.type, types.IntType)
-        assert isinstance(typ, types.PointerType)
+        """
+        Cast this integer constant to the given pointer type.
+        """
+        if not isinstance(self.type, types.IntType):
+            raise TypeError("can only call inttoptr() on integer constants, not '%s'"
+                            % (self.type,))
+        if not isinstance(typ, types.PointerType):
+            raise TypeError("can only inttoptr() to pointer type, not '%s'"
+                            % (typ,))
+
         op = "inttoptr ({0} {1} to {2})".format(self.type,
                                                 self.get_reference(),
                                                 typ)
-        return ConstOp(typ, op)
+        return FormattedConstant(typ, op)
 
     def gep(self, indices):
-        assert isinstance(self.type, types.PointerType)
+        """
+        Call getelementptr on this pointer constant.
+        """
+        if not isinstance(self.type, types.PointerType):
+            raise TypeError("can only call gep() on pointer constants, not '%s'"
+                            % (self.type,))
 
         outtype = self.type
         for i in indices:
@@ -92,59 +84,80 @@ class ConstOpMixin(object):
         strindices = ["{0} {1}".format(idx.type, idx.get_reference())
                       for idx in indices]
 
-        op = "getelementptr ({0} {1}, {2})".format(self.type,
-                                                   self.get_reference(),
-                                                   ', '.join(strindices))
-        return ConstOp(outtype.as_pointer(), op)
+        op = "getelementptr ({0}, {1} {2}, {3})".format(
+            self.type.pointee, self.type,
+            self.get_reference(), ', '.join(strindices))
+        return FormattedConstant(outtype.as_pointer(), op)
 
 
-class Constant(ConstOpMixin):
+class Value(object):
     """
-    Constant values
+    The base class for all values.
+    """
+
+    def __repr__(self):
+        return "<ir.%s type='%s' ...>" % (self.__class__.__name__, self.type,)
+
+
+class _Undefined(object):
+    """
+    'undef': a value for undefined values.
+    """
+
+Undefined = _Undefined()
+
+
+class Constant(_StrCaching, _StringReferenceCaching, _ConstOpMixin, Value):
+    """
+    A constant LLVM value.
     """
 
     def __init__(self, typ, constant):
+        assert isinstance(typ, types.Type)
         assert not isinstance(typ, types.VoidType)
         self.type = typ
+        if isinstance(constant, (list, tuple)):
+            # Recursively wrap aggregate constants
+            constant = typ.wrap_constant_value(constant)
         self.constant = constant
 
-    def __str__(self):
+    def _to_string(self):
         return '{0} {1}'.format(self.type, self.get_reference())
 
-    def get_reference(self):
-        if isinstance(self.constant, bytearray):
-            val = 'c"{0}"'.format(_escape_string(self.constant))
-
-        elif self.constant is None:
+    def _get_reference(self):
+        if self.constant is None:
             val = self.type.null
 
         elif self.constant is Undefined:
             val = "undef"
 
-        elif isinstance(self.type, types.ArrayType):
-            fmter = lambda x: "{0} {1}".format(x.type, x.get_reference())
-            val = "[{0}]".format(', '.join(map(fmter, self.constant)))
-
-        elif isinstance(self.type, types.BaseStructType):
-            fmter = lambda x: "{0} {1}".format(x.type, x.get_reference())
-            val = "{{{0}}}".format(', '.join(map(fmter, self.constant)))
-
-        elif isinstance(self.type, (types.FloatType, types.DoubleType)):
-            if isinstance(self.type, types.FloatType):
-                val = _as_float(self.constant)
-            else:
-                val = self.constant
-            val = _format_float(val, 'd', 'Q', 16)
-
-        elif isinstance(self.constant, bool):
-            val = str(self.constant).lower()
+        elif isinstance(self.constant, bytearray):
+            val = 'c"{0}"'.format(_escape_string(self.constant))
 
         else:
-            val = str(self.constant)
+            val = self.type.format_constant(self.constant)
+
         return val
 
     @classmethod
+    def literal_array(cls, elems):
+        """
+        Construct a literal array constant made of the given members.
+        """
+        tys = [el.type for el in elems]
+        if len(tys) == 0:
+            raise ValueError("need at least one element")
+        ty = tys[0]
+        for other in tys:
+            if ty != other:
+                raise TypeError("all elements must have the same type")
+        return cls(types.ArrayType(ty, len(elems)), elems)
+
+    @classmethod
     def literal_struct(cls, elems):
+        """
+        Construct a literal structure constant made of the given members.
+        """
         tys = [el.type for el in elems]
         return cls(types.LiteralStructType(tys), elems)
 
@@ -160,73 +173,100 @@ class Constant(ConstOpMixin):
     def __hash__(self):
         return hash(str(self))
 
+    def __repr__(self):
+        return "<ir.Constant type='%s' value=%r>" % (self.type, self.constant)
 
-class Value(object):
+
+class FormattedConstant(Constant):
+    """
+    A constant with an already formatted IR representation.
+    """
+
+    def __init__(self, typ, constant):
+        assert isinstance(constant, str)
+        Constant.__init__(self, typ, constant)
+
+    def _to_string(self):
+        return self.constant
+
+    def _get_reference(self):
+        return self.constant
+
+
+class NamedValue(_StrCaching, _StringReferenceCaching, Value):
+    """
+    The base class for named values.
+    """
     name_prefix = '%'
     deduplicate_name = True
-    nested_scope = False
 
     def __init__(self, parent, type, name):
         assert parent is not None
+        assert isinstance(type, types.Type)
         self.parent = parent
         self.type = type
-        pscope = self.parent.scope
-        self.scope = pscope.get_child() if self.nested_scope else pscope
-        self._name = None
-        self.name = name
+        self._set_name(name)
 
-    def __str__(self):
-        with _utils.StringIO() as buf:
-            if self.type == types.VoidType():
-                self.descr(buf)
-                return buf.getvalue().rstrip()
-            else:
-                name = self.get_reference()
-                self.descr(buf)
-                descr = buf.getvalue().rstrip()
-                return "{name} = {descr}".format(**locals())
+    def _to_string(self):
+        buf = []
+        if self.type != types.VoidType():
+            buf.append("{0} = ".format(self.get_reference()))
+        self.descr(buf)
+        return "".join(buf).rstrip()
 
     def descr(self, buf):
         raise NotImplementedError
 
-    @property
-    def name(self):
+    def _get_name(self):
         return self._name
 
-    @name.setter
-    def name(self, name):
-        if self.deduplicate_name:
-            name = self.scope.deduplicate(name)
-
-        self.scope.register(name)
+    def _set_name(self, name):
+        name = self.parent.scope.register(name, deduplicate=self.deduplicate_name)
         self._name = name
 
-    def get_reference(self):
-        return self.name_prefix + _wrapname(self.name)
+    name = property(_get_name, _set_name)
+
+    def _get_reference(self):
+        name = self.name
+        # Quote and escape value name
+        if '\\' in name or '"' in name:
+            name = name.replace('\\', '\\5c').replace('"', '\\22')
+        return '{0}"{1}"'.format(self.name_prefix, name)
+
+    def __repr__(self):
+        return "<ir.%s %r of type '%s'>" % (
+            self.__class__.__name__, self.name, self.type)
 
     @property
     def function_type(self):
-        if isinstance(self.type, types.PointerType):
+        ty = self.type
+        if isinstance(ty, types.PointerType):
             ty = self.type.pointee
         if isinstance(ty, types.FunctionType):
             return ty
         else:
-            raise TypeError(self.type)
+            raise TypeError("Not a function: {0}".format(self.type))
 
 
-class MetaDataString(Value):
+class MetaDataString(NamedValue):
+    """
+    A metadata string, i.e. a constant string used as a value in a metadata
+    node.
+    """
+
     def __init__(self, parent, string):
-        super(MetaDataString, self).__init__(parent, types.MetaData(), name="")
+        super(MetaDataString, self).__init__(parent,
+                                             types.MetaDataType(),
+                                             name="")
         self.string = string
 
     def descr(self, buf):
-        print("metadata !\"{0}\"".format(self.string), file=buf)
+        buf += (self.get_reference(), "\n")
 
-    def get_reference(self):
-        return "!\"{0}\"".format(self.string)
+    def _get_reference(self):
+        return '!"{0}"'.format(_escape_string(self.string))
 
-    def __str__(self):
-        return self.get_reference()
+    _to_string = _get_reference
 
     def __eq__(self, other):
         if isinstance(other, MetaDataString):
@@ -241,8 +281,35 @@ class MetaDataString(Value):
         return hash(self.string)
 
 
+class MetaDataArgument(_StrCaching, _StringReferenceCaching, Value):
+    """
+    An argument value to a function taking metadata arguments.
+    This can wrap any other kind of LLVM value.
+
+    Do not instantiate directly, Builder.call() will create these
+    automatically.
+    """
+
+    def __init__(self, value):
+        assert isinstance(value, Value)
+        assert not isinstance(value.type, types.MetaDataType)
+        self.type = types.MetaDataType()
+        self.wrapped_value = value
+
+    def _get_reference(self):
+        # e.g. "i32* %2"
+        return "{0} {1}".format(self.wrapped_value.type,
+                                self.wrapped_value.get_reference())
+
+    _to_string = _get_reference
+
+
 class NamedMetaData(object):
-    name_prefix = '!'
+    """
+    A named metadata node.
+
+    Do not instantiate directly, use Module.add_named_metadata() instead.
+    """
 
     def __init__(self, parent):
         self.parent = parent
@@ -252,24 +319,35 @@ class NamedMetaData(object):
         self.operands.append(md)
 
 
-class MDValue(Value):
+class MDValue(NamedValue):
+    """
+    A metadata node's value, consisting of a sequence of elements ("operands").
+
+    Do not instantiate directly, use Module.add_metadata() instead.
+    """
     name_prefix = '!'
 
     def __init__(self, parent, values, name):
-        super(MDValue, self).__init__(parent, types.MetaData(), name=name)
+        super(MDValue, self).__init__(parent,
+                                      types.MetaDataType(),
+                                      name=name)
         self.operands = tuple(values)
         parent.metadata.append(self)
 
-    @property
-    def operand_count(self):
-        return len(self.operands)
-
     def descr(self, buf):
-        operands = ', '.join("{0} {1}".format(op.type, op.get_reference())
-                             for op in self.operands)
-        print("metadata !{{ {operands} }}".format(operands=operands), file=buf)
+        operands = []
+        for op in self.operands:
+            if isinstance(op.type, types.MetaDataType):
+                if isinstance(op, Constant) and op.constant == None:
+                    operands.append("null")
+                else:
+                    operands.append(op.get_reference())
+            else:
+                operands.append("{0} {1}".format(op.type, op.get_reference()))
+        operands = ', '.join(operands)
+        buf += ("!{{ {0} }}".format(operands), "\n")
 
-    def get_reference(self):
+    def _get_reference(self):
         return self.name_prefix + str(self.name)
 
     def __eq__(self, other):
@@ -285,23 +363,106 @@ class MDValue(Value):
         return hash(self.operands)
 
 
-class GlobalValue(Value, ConstOpMixin):
+class DIToken:
+    """
+    A debug information enumeration value that should appear bare in
+    the emitted metadata.
+
+    Use this to wrap known constants, e.g. the DW_* enumerations.
+    """
+    def __init__(self, value):
+        self.value = value
+
+
+class DIValue(NamedValue):
+    """
+    A debug information descriptor, containing key-value pairs.
+
+    Do not instantiate directly, use Module.add_debug_info() instead.
+    """
+    name_prefix = '!'
+
+    def __init__(self, parent, is_distinct, kind, operands, name):
+        super(DIValue, self).__init__(parent,
+                                      types.MetaDataType(),
+                                      name=name)
+        self.is_distinct = is_distinct
+        self.kind = kind
+        self.operands = tuple(operands)
+        parent.metadata.append(self)
+
+    def descr(self, buf):
+        if self.is_distinct:
+            buf += ("distinct ",)
+        operands = []
+        for key, value in self.operands:
+            if value is None:
+                strvalue = "null"
+            elif value is True:
+                strvalue = "true"
+            elif value is False:
+                strvalue = "false"
+            elif isinstance(value, DIToken):
+                strvalue = value.value
+            elif isinstance(value, str):
+                strvalue = '"{}"'.format(_escape_string(value))
+            elif isinstance(value, six.integer_types):
+                strvalue = str(value)
+            elif isinstance(value, NamedValue):
+                strvalue = value.get_reference()
+            else:
+                raise TypeError("invalid operand type for debug info: %r"
+                                % (value,))
+            operands.append("{0}: {1}".format(key, strvalue))
+        operands = ', '.join(operands)
+        buf += ("!", self.kind, "(", operands, ")\n")
+
+    def _get_reference(self):
+        return self.name_prefix + str(self.name)
+
+    def __eq__(self, other):
+        if isinstance(other, DIValue):
+            return self.is_distinct == other.is_distinct and \
+                self.kind == other.kind and \
+                self.operands == other.operands
+        else:
+            return False
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash((self.is_distinct, self.kind, self.operands))
+
+
+class GlobalValue(NamedValue, _ConstOpMixin):
+    """
+    A global value.
+    """
     name_prefix = '@'
     deduplicate_name = False
 
     def __init__(self, *args, **kwargs):
         super(GlobalValue, self).__init__(*args, **kwargs)
         self.linkage = ''
+        self.storage_class = ''
 
 
 class GlobalVariable(GlobalValue):
+    """
+    A global variable.
+    """
+
     def __init__(self, module, typ, name, addrspace=0):
+        assert isinstance(typ, types.Type)
         super(GlobalVariable, self).__init__(module, typ.as_pointer(addrspace),
                                              name=name)
-        self.gtype = typ
+        self.value_type = typ
         self.initializer = None
+        self.unnamed_addr = False
         self.global_constant = False
         self.addrspace = addrspace
+        self.align = None
         self.parent.add_global(self)
 
     def descr(self, buf):
@@ -316,47 +477,72 @@ class GlobalVariable(GlobalValue):
         else:
             linkage = self.linkage
 
+        if linkage:
+            buf.append(linkage + " ")
+        if self.storage_class:
+            buf.append(self.storage_class + " ")
+        if self.unnamed_addr:
+            buf.append("unnamed_addr ")
         if self.addrspace != 0:
-            addrspace = 'addrspace({0:d})'.format(self.addrspace)
-        else:
-            addrspace = ''
+            buf.append('addrspace({0:d}) '.format(self.addrspace))
 
-        print("{linkage} {addrspace} {kind} {type} ".format(
-            addrspace=addrspace,
-            linkage=linkage,
-            kind=kind,
-            type=self.gtype),
-              file=buf,
-              end='')
+        buf.append("{kind} {type}" .format(kind=kind, type=self.value_type))
 
         if self.initializer is not None:
-            print(self.initializer.get_reference(), file=buf, end='')
-            # else:
-        #     print('undef', file=buf, end='')
+            if self.initializer.type != self.value_type:
+                raise TypeError("got initializer of type %s "
+                                "for global value type %s"
+                                % (self.initializer.type, self.value_type))
+            buf.append(" " + self.initializer.get_reference())
+        elif linkage not in ('external', 'extern_weak'):
+            # emit 'undef' for non-external linkage GV
+            buf.append(" " + self.value_type(Undefined).get_reference())
 
-        print(file=buf)
+        if self.align is not None:
+            buf.append(", align %d" % (self.align,))
+
+        buf.append("\n")
 
 
 class AttributeSet(set):
+    """A set of string attribute.
+    Only accept items listed in *_known*.
+
+    Properties:
+    * Iterate in sorted order
+    """
     _known = ()
 
+    def __init__(self, args=()):
+        if isinstance(args, str):
+            args = [args]
+        for name in args:
+            self.add(name)
+
     def add(self, name):
-        assert name in self._known
+        if name not in self._known:
+            raise ValueError('unknown attr {!r} for {}'.format(name, self))
         return super(AttributeSet, self).add(name)
+
+    def __iter__(self):
+        # In sorted order
+        return iter(sorted(super(AttributeSet, self).__iter__()))
 
 
 class FunctionAttributes(AttributeSet):
-    _known = frozenset(['alwaysinline', 'builtin', 'cold', 'inlinehint',
-                        'jumptable', 'minsize', 'naked', 'nobuiltin',
-                        'noduplicate', 'noimplicitfloat', 'noinline',
-                        'nonlazybind', 'noredzone', 'noreturn', 'nounwind',
-                        'optnone', 'optsize', 'readnone', 'readonly',
-                        'returns_twice', 'sanitize_address',
-                        'sanitize_memory', 'sanitize_thread', 'ssp',
-                        'sspreg', 'sspstrong', 'uwtable'])
+    _known = frozenset([
+        'argmemonly', 'alwaysinline', 'builtin', 'cold',
+        'inaccessiblememonly', 'inaccessiblemem_or_argmemonly', 'inlinehint',
+        'jumptable', 'minsize', 'naked', 'nobuiltin', 'noduplicate',
+        'noimplicitfloat', 'noinline', 'nonlazybind', 'norecurse',
+        'noredzone', 'noreturn', 'nounwind', 'optnone', 'optsize',
+        'readnone', 'readonly', 'returns_twice', 'sanitize_address',
+        'sanitize_memory', 'sanitize_thread', 'ssp',
+        'sspreg', 'sspstrong', 'uwtable'])
 
     def __init__(self):
         self._alignstack = 0
+        self._personality = None
 
     @property
     def alignstack(self):
@@ -367,27 +553,43 @@ class FunctionAttributes(AttributeSet):
         assert val >= 0
         self._alignstack = val
 
+    @property
+    def personality(self):
+        return self._personality
+
+    @personality.setter
+    def personality(self, val):
+        assert val is None or isinstance(val, GlobalValue)
+        self._personality = val
+
     def __repr__(self):
-        attrs = sorted(self)
+        attrs = list(self)
         if self.alignstack:
             attrs.append('alignstack({0:d})'.format(self.alignstack))
+        if self.personality:
+            attrs.append('personality {persty} {persfn}'.format(
+                            persty=self.personality.type,
+                            persfn=self.personality.get_reference()))
         return ' '.join(attrs)
 
 
-class Function(GlobalValue):
+class Function(GlobalValue, _HasMetadata):
     """Represent a LLVM Function but does uses a Module as parent.
     Global Values are stored as a set of dependencies (attribute `depends`).
     """
-    nested_scope = True
-
     def __init__(self, module, ftype, name):
+        assert isinstance(ftype, types.Type)
         super(Function, self).__init__(module, ftype.as_pointer(), name=name)
         self.ftype = ftype
+        self.scope = _utils.NameScope()
         self.blocks = []
         self.attributes = FunctionAttributes()
-        self.args = tuple([Argument(self, i, t)
-                           for i, t in enumerate(ftype.args)])
+        self.args = tuple([Argument(self, t)
+                           for t in ftype.args])
+        self.return_value = ReturnValue(self, ftype.return_type)
         self.parent.add_global(self)
+        self.calling_convention = ''
+        self.metadata = {}
 
     @property
     def module(self):
@@ -418,17 +620,22 @@ class Function(GlobalValue):
         Describe the prototype ("head") of the function.
         """
         state = "define" if self.blocks else "declare"
-        retty = self.ftype.return_type
+        ret = self.return_value
         args = ", ".join(str(a) for a in self.args)
         name = self.get_reference()
         attrs = self.attributes
-        vararg = ', ...' if self.ftype.var_arg else ''
+        if any(self.args):
+            vararg = ', ...' if self.ftype.var_arg else ''
+        else:
+            vararg = '...' if self.ftype.var_arg else ''
         linkage = self.linkage
-        prefix = " ".join(str(x) for x in [state, linkage, retty] if x)
-        prototype = "{prefix} {name}({args}{vararg}) {attrs}" \
-            .format(
-            **locals())
-        print(prototype, file=buf)
+        cconv = self.calling_convention
+        prefix = " ".join(str(x) for x in [state, linkage, cconv, ret] if x)
+        metadata = self._stringify_metadata()
+        prototype = "{prefix} {name}({args}{vararg}) {attrs}{metadata}\n".format(
+            prefix=prefix, name=name, args=args, vararg=vararg,
+            attrs=attrs, metadata=metadata)
+        buf.append(prototype)
 
     def descr_body(self, buf):
         """
@@ -440,14 +647,14 @@ class Function(GlobalValue):
     def descr(self, buf):
         self.descr_prototype(buf)
         if self.blocks:
-            print('{', file=buf)
+            buf.append("{\n")
             self.descr_body(buf)
-            print('}', file=buf)
+            buf.append("}\n")
 
     def __str__(self):
-        with _utils.StringIO() as buf:
-            self.descr(buf)
-            return buf.getvalue()
+        buf = []
+        self.descr(buf)
+        return "".join(buf)
 
     @property
     def is_declaration(self):
@@ -455,15 +662,29 @@ class Function(GlobalValue):
 
 
 class ArgumentAttributes(AttributeSet):
-    _known = frozenset(['nocapture'])  # TODO
+    _known = frozenset(['byval', 'inalloca', 'inreg', 'nest', 'noalias',
+                        'nocapture', 'nonnull', 'returned', 'signext',
+                        'sret', 'zeroext'])
 
 
-class Argument(Value):
-    def __init__(self, parent, pos, typ, name=''):
-        super(Argument, self).__init__(parent, typ, name=name)
+class _BaseArgument(NamedValue):
+    def __init__(self, parent, typ, name=''):
+        assert isinstance(typ, types.Type)
+        super(_BaseArgument, self).__init__(parent, typ, name=name)
         self.parent = parent
-        self.pos = pos
         self.attributes = ArgumentAttributes()
+
+    def __repr__(self):
+        return "<ir.%s %r of type %s>" % (self.__class__.__name__, self.name, self.type)
+
+    def add_attribute(self, attr):
+        self.attributes.add(attr)
+
+
+class Argument(_BaseArgument):
+    """
+    The specification of a function argument.
+    """
 
     def __str__(self):
         if self.attributes:
@@ -472,13 +693,22 @@ class Argument(Value):
         else:
             return "{0} {1}".format(self.type, self.get_reference())
 
-    def add_attribute(self, attr):
-        self.attributes.add(attr)
 
-
-class Block(Value):
+class ReturnValue(_BaseArgument):
     """
-    A LLVM IR building block. A building block is a sequence of
+    The specification of a function's return value.
+    """
+
+    def __str__(self):
+        if self.attributes:
+            return "{0} {1}".format(' '.join(self.attributes), self.type)
+        else:
+            return str(self.type)
+
+
+class Block(NamedValue):
+    """
+    A LLVM IR basic block. A basic block is a sequence of
     instructions whose execution always goes from start to end.  That
     is, a control flow instruction (branch) can only appear as the
     last instruction, and incoming branches can only jump to the first
@@ -487,6 +717,7 @@ class Block(Value):
 
     def __init__(self, parent, name=''):
         super(Block, self).__init__(parent, types.LabelType(), name=name)
+        self.scope = parent.scope
         self.instructions = []
         self.terminator = None
 
@@ -498,11 +729,13 @@ class Block(Value):
     def function(self):
         return self.parent
 
+    @property
+    def module(self):
+        return self.parent.module
+
     def descr(self, buf):
-        print("{0}:".format(self.name), file=buf)
-        for instr in self.instructions:
-            print('  ', end='', file=buf)
-            print(instr, file=buf)
+        buf.append("{0}:\n".format(self.name))
+        buf += ["  {0}\n".format(instr) for instr in self.instructions]
 
     def replace(self, old, new):
         """Replace an instruction"""
@@ -516,3 +749,23 @@ class Block(Value):
             for instr in bb.instructions:
                 instr.replace_usage(old, new)
 
+
+class BlockAddress(Value):
+    """
+    The address of a basic block.
+    """
+
+    def __init__(self, function, basic_block):
+        assert isinstance(function, Function)
+        assert isinstance(basic_block, Block)
+        self.type = types.IntType(8).as_pointer()
+        self.function = function
+        self.basic_block = basic_block
+
+    def __str__(self):
+        return '{0} {1}'.format(self.type, self.get_reference())
+
+    def get_reference(self):
+        return "blockaddress({0}, {1})".format(
+                    self.function.get_reference(),
+                    self.basic_block.get_reference())

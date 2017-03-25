@@ -1,10 +1,10 @@
 from __future__ import print_function, absolute_import
 from ctypes import (c_char_p, byref, POINTER, c_bool, create_string_buffer,
-                    c_void_p, c_size_t, cast, string_at)
+                    c_size_t, string_at)
 
 from . import ffi
 from .linker import link_modules
-from .common import _encode_string
+from .common import _decode_string, _encode_string
 from .value import ValueRef
 
 
@@ -64,7 +64,7 @@ class ModuleRef(ffi.ObjectRef):
             ffi.lib.LLVMPY_DisposeString(ptr)
 
     def _dispose(self):
-        ffi.lib.LLVMPY_DisposeModule(self)
+        self._capi.LLVMPY_DisposeModule(self)
 
     def get_function(self, name):
         """
@@ -93,6 +93,17 @@ class ModuleRef(ffi.ObjectRef):
         with ffi.OutputString() as outmsg:
             if ffi.lib.LLVMPY_VerifyModule(self, outmsg):
                 raise RuntimeError(str(outmsg))
+
+    @property
+    def name(self):
+        """
+        The module's identifier.
+        """
+        return _decode_string(ffi.lib.LLVMPY_GetModuleName(self))
+
+    @name.setter
+    def name(self, value):
+        ffi.lib.LLVMPY_SetModuleName(self, _encode_string(value))
 
     @property
     def data_layout(self):
@@ -127,15 +138,23 @@ class ModuleRef(ffi.ObjectRef):
                                      strrep.encode('utf8')))
 
     def link_in(self, other, preserve=False):
-        link_modules(self, other, preserve)
-        if not preserve:
-            other.close()
+        """
+        Link the *other* module into this one.  The *other* module will
+        be destroyed unless *preserve* is true.
+        """
+        if preserve:
+            other = other.clone()
+        link_modules(self, other)
 
     @property
     def global_variables(self):
         """
         Return an iterator over this module's global variables.
         The iterator will yield a ValueRef for each global variable.
+
+        Note that global variables don't include functions
+        (a function is a "global value" but not a "global variable" in
+         LLVM parlance)
         """
         it = ffi.lib.LLVMPY_ModuleGlobalsIter(self)
         return _GlobalsIterator(it, module=self)
@@ -148,6 +167,9 @@ class ModuleRef(ffi.ObjectRef):
         """
         it = ffi.lib.LLVMPY_ModuleFunctionsIter(self)
         return _FunctionsIterator(it, module=self)
+
+    def clone(self):
+        return ModuleRef(ffi.lib.LLVMPY_CloneModule(self))
 
 
 class _Iterator(ffi.ObjectRef):
@@ -173,7 +195,7 @@ class _Iterator(ffi.ObjectRef):
 class _GlobalsIterator(_Iterator):
 
     def _dispose(self):
-        ffi.lib.LLVMPY_DisposeGlobalsIter(self)
+        self._capi.LLVMPY_DisposeGlobalsIter(self)
 
     def _next(self):
         return ffi.lib.LLVMPY_GlobalsIterNext(self)
@@ -182,7 +204,7 @@ class _GlobalsIterator(_Iterator):
 class _FunctionsIterator(_Iterator):
 
     def _dispose(self):
-        ffi.lib.LLVMPY_DisposeFunctionsIter(self)
+        self._capi.LLVMPY_DisposeFunctionsIter(self)
 
     def _next(self):
         return ffi.lib.LLVMPY_FunctionsIterNext(self)
@@ -243,3 +265,11 @@ ffi.lib.LLVMPY_DisposeFunctionsIter.argtypes = [ffi.LLVMFunctionsIterator]
 
 ffi.lib.LLVMPY_FunctionsIterNext.argtypes = [ffi.LLVMFunctionsIterator]
 ffi.lib.LLVMPY_FunctionsIterNext.restype = ffi.LLVMValueRef
+
+ffi.lib.LLVMPY_CloneModule.argtypes = [ffi.LLVMModuleRef]
+ffi.lib.LLVMPY_CloneModule.restype = ffi.LLVMModuleRef
+
+ffi.lib.LLVMPY_GetModuleName.argtypes = [ffi.LLVMModuleRef]
+ffi.lib.LLVMPY_GetModuleName.restype = c_char_p
+
+ffi.lib.LLVMPY_SetModuleName.argtypes = [ffi.LLVMModuleRef, c_char_p]

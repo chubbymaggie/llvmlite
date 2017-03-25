@@ -4,13 +4,14 @@
 #include "llvm-c/TargetMachine.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/IR/LegacyPassManager.h"
-#include "llvm/Target/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/IR/Type.h"
 
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 
 
 namespace llvm {
@@ -28,6 +29,10 @@ inline Target *unwrap(LLVMTargetRef T) {
     return reinterpret_cast<Target*>(T);
 }
 
+inline TargetMachine *unwrap(LLVMTargetMachineRef TM) {
+    return reinterpret_cast<TargetMachine *>(TM);
+}
+
 inline LLVMTargetMachineRef wrap(TargetMachine *TM) {
     return reinterpret_cast<LLVMTargetMachineRef>(TM);
 }
@@ -37,8 +42,34 @@ inline LLVMTargetMachineRef wrap(TargetMachine *TM) {
 extern "C" {
 
 API_EXPORT(void)
+LLVMPY_GetProcessTriple(const char **Out) {
+    *Out = LLVMPY_CreateString(llvm::sys::getProcessTriple().c_str());
+}
+
+/**
+ * Output the feature string to the output argument.
+ * Features are prefixed with '+' or '-' for enabled or disabled, respectively.
+ * Features are separated by ','.
+ */
+API_EXPORT(int)
+LLVMPY_GetHostCPUFeatures(const char **Out){
+    llvm::StringMap<bool> features;
+    std::ostringstream buf;
+    if ( llvm::sys::getHostCPUFeatures(features) ) {
+        for (auto &F : features) {
+            if (buf.tellp()){
+                buf << ',';
+            }
+            buf << ((F.second? "+": "-") + F.first()).str();
+        }
+        *Out = LLVMPY_CreateString(buf.str().c_str());
+        return 1;
+    }
+    return 0;
+}
+
+API_EXPORT(void)
 LLVMPY_GetDefaultTargetTriple(const char **Out) {
-    // Should we use getProcessTriple() instead?
     *Out = LLVMPY_CreateString(llvm::sys::getDefaultTargetTriple().c_str());
 }
 
@@ -47,17 +78,16 @@ LLVMPY_GetHostCPUName(const char **Out) {
     *Out = LLVMPY_CreateString(llvm::sys::getHostCPUName().data());
 }
 
+API_EXPORT(int)
+LLVMPY_GetTripleObjectFormat(const char *tripleStr)
+{
+    return llvm::Triple(tripleStr).getObjectFormat();
+}
+
 API_EXPORT(LLVMTargetDataRef)
 LLVMPY_CreateTargetData(const char *StringRep)
 {
     return LLVMCreateTargetData(StringRep);
-}
-
-API_EXPORT(void)
-LLVMPY_AddTargetData(LLVMTargetDataRef TD,
-                     LLVMPassManagerRef PM)
-{
-    LLVMAddTargetData(TD, PM);
 }
 
 
@@ -96,6 +126,16 @@ LLVMPY_ABISizeOfElementType(LLVMTargetDataRef TD, LLVMTypeRef Ty)
         return -1;
     tp = tp->getSequentialElementType();
     return (long long) LLVMABISizeOfType(TD, llvm::wrap(tp));
+}
+
+API_EXPORT(long long)
+LLVMPY_ABIAlignmentOfElementType(LLVMTargetDataRef TD, LLVMTypeRef Ty)
+{
+    llvm::Type *tp = llvm::unwrap(Ty);
+    if (!tp->isPointerTy())
+        return -1;
+    tp = tp->getSequentialElementType();
+    return (long long) LLVMABIAlignmentOfType(TD, llvm::wrap(tp));
 }
 
 
@@ -167,7 +207,7 @@ LLVMPY_CreateTargetMachine(LLVMTargetRef T,
     else
         cm = CodeModel::Default;
 
-    Reloc::Model rm;
+    Optional<Reloc::Model> rm;
     std::string rms(RelocModel);
     if (rms == "static")
         rm = Reloc::Static;
@@ -175,11 +215,9 @@ LLVMPY_CreateTargetMachine(LLVMTargetRef T,
         rm = Reloc::PIC_;
     else if (rms == "dynamicnopic")
         rm = Reloc::DynamicNoPIC;
-    else
-        rm = Reloc::Default;
 
     TargetOptions opt;
-    opt.JITEmitDebugInfo = EmitJITDebug;
+//     opt.JITEmitDebugInfo = EmitJITDebug;
     opt.PrintMachineCode = PrintMC;
 
     return wrap(unwrap(T)->createTargetMachine(Triple, CPU, Features, opt,
@@ -193,6 +231,18 @@ LLVMPY_DisposeTargetMachine(LLVMTargetMachineRef TM)
     return LLVMDisposeTargetMachine(TM);
 }
 
+API_EXPORT(void)
+LLVMPY_GetTargetMachineTriple(LLVMTargetMachineRef TM, const char **Out)
+{
+    // result is already strdup()ed by LLVMGetTargetMachineTriple
+    *Out = LLVMGetTargetMachineTriple(TM);
+}
+
+API_EXPORT(void)
+LLVMPY_SetTargetMachineAsmVerbosity(LLVMTargetMachineRef TM, int verbose)
+{
+    LLVMSetTargetMachineAsmVerbosity(TM, verbose);
+}
 
 API_EXPORT(LLVMMemoryBufferRef)
 LLVMPY_TargetMachineEmitToMemory (
@@ -220,9 +270,9 @@ LLVMPY_TargetMachineEmitToMemory (
 }
 
 API_EXPORT(LLVMTargetDataRef)
-LLVMPY_GetTargetMachineData(LLVMTargetMachineRef TM)
+LLVMPY_CreateTargetMachineData(LLVMTargetMachineRef TM)
 {
-    return LLVMGetTargetMachineData(TM);
+    return llvm::wrap(new llvm::DataLayout(llvm::unwrap(TM)->createDataLayout()));
 }
 
 API_EXPORT(void)
@@ -253,53 +303,16 @@ LLVMPY_DisposeMemoryBuffer(LLVMMemoryBufferRef MB)
     return LLVMDisposeMemoryBuffer(MB);
 }
 
+/*
 
-API_EXPORT(LLVMTargetLibraryInfoRef)
-LLVMPY_CreateTargetLibraryInfo(const char *Triple)
-{
-    return llvm::wrap(new llvm::TargetLibraryInfo(llvm::Triple(Triple)));
+If needed:
+
+explicit TargetLibraryInfoWrapperPass(const Triple &T);
+
+void LLVMAddTargetLibraryInfo(LLVMTargetLibraryInfoRef TLI,
+                              LLVMPassManagerRef PM) {
+  unwrap(PM)->add(new TargetLibraryInfoWrapperPass(*unwrap(TLI)));
 }
-
-API_EXPORT(void)
-LLVMPY_DisposeTargetLibraryInfo(LLVMTargetLibraryInfoRef TLI)
-{
-    delete llvm::unwrap(TLI);
-}
-
-API_EXPORT(void)
-LLVMPY_AddTargetLibraryInfo(
-    LLVMTargetLibraryInfoRef TLI,
-    LLVMPassManagerRef PM
-    )
-{
-    LLVMAddTargetLibraryInfo(TLI, PM);
-}
-
-API_EXPORT(void)
-LLVMPY_DisableAllBuiltins(LLVMTargetLibraryInfoRef TLI)
-{
-    llvm::unwrap(TLI)->disableAllFunctions();
-}
-
-API_EXPORT(int)
-LLVMPY_GetLibFunc(LLVMTargetLibraryInfoRef TLI, const char *Name, int *OutF)
-{
-    llvm::LibFunc::Func F;
-    if (llvm::unwrap(TLI)->getLibFunc(Name, F)) {
-        /* Ok */
-        *OutF = F;
-        return 1;
-    } else {
-        /* Failed */
-        return 0;
-    }
-}
-
-API_EXPORT(void)
-LLVMPY_SetUnavailableLibFunc(LLVMTargetLibraryInfoRef TLI, int F)
-{
-    llvm::unwrap(TLI)->setUnavailable((llvm::LibFunc::Func)F);
-}
-
+*/
 
 } // end extern "C"

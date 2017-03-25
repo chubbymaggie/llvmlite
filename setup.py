@@ -1,16 +1,25 @@
 try:
     from setuptools import setup, Extension
+    # Required for compatibility with pip (issue #177)
+    from setuptools.command.install import install
 except ImportError:
     from distutils.core import setup, Extension
+    from distutils.command.install import install
 
-from distutils.spawn import spawn
+
 from distutils.command.build import build
 from distutils.command.build_ext import build_ext
-from distutils.command.install import install
+from distutils.command.clean import clean
+from distutils import log
+from distutils.dir_util import remove_tree
+from distutils.spawn import spawn
 import os
 import sys
+import shutil
 
-from llvmlite.utils import get_library_files
+if os.environ.get('READTHEDOCS', None) == 'True':
+    sys.exit("setup.py disabled on readthedocs: called with %s"
+             % (sys.argv,))
 
 import versioneer
 
@@ -21,8 +30,7 @@ versioneer.tag_prefix = 'v' # tags are like v1.2.0
 versioneer.parentdir_prefix = 'llvmlite-' # dirname like 'myproject-1.2.0'
 
 
-here_dir = os.path.dirname(__file__)
-
+here_dir = os.path.dirname(os.path.abspath(__file__))
 
 cmdclass = versioneer.get_cmdclass()
 build = cmdclass.get('build', build)
@@ -53,6 +61,7 @@ class LlvmliteBuildExt(build_ext):
         spawn(cmd, dry_run=self.dry_run)
         # HACK: this makes sure the library file (which is large) is only
         # included in binary builds, not source builds.
+        from llvmlite.utils import get_library_files
         self.distribution.package_data = {
             "llvmlite.binding": get_library_files(),
         }
@@ -62,17 +71,43 @@ class LlvmliteInstall(install):
     # Ensure install see the libllvmlite shared library
     # This seems to only be necessary on OSX.
     def run(self):
+        from llvmlite.utils import get_library_files
         self.distribution.package_data = {
             "llvmlite.binding": get_library_files(),
         }
         install.run(self)
 
 
+class LlvmliteClean(clean):
+    """Custom clean command to tidy up the project root."""
+    def run(self):
+        clean.run(self)
+        path = os.path.join(here_dir, 'llvmlite.egg-info')
+        if os.path.isdir(path):
+            remove_tree(path, dry_run=self.dry_run)
+        if not self.dry_run:
+            self._rm_walk()
+
+    def _rm_walk(self):
+        for path, dirs, files in os.walk(here_dir):
+            if any(p.startswith('.') for p in path.split(os.path.sep)):
+                # Skip hidden directories like the git folder right away
+                continue
+            if path.endswith('__pycache__'):
+                remove_tree(path, dry_run=self.dry_run)
+            else:
+                for fname in files:
+                    if fname.endswith('.pyc') or fname.endswith('.so'):
+                        fpath = os.path.join(path, fname)
+                        os.remove(fpath)
+                        log.info("removing '%s'", fpath)
+
+
 cmdclass.update({'build': LlvmliteBuild,
                  'build_ext': LlvmliteBuildExt,
                  'install': LlvmliteInstall,
+                 'clean': LlvmliteClean,
                  })
-
 
 packages = ['llvmlite',
             'llvmlite.binding',
@@ -81,26 +116,31 @@ packages = ['llvmlite',
             'llvmlite.tests',
             ]
 
+install_requires = []
+if sys.version_info < (3, 4):
+    install_requires.append('enum34')
+
 setup(name='llvmlite',
       description="lightweight wrapper around basic LLVM functionality",
       version=versioneer.get_version(),
       classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Operating System :: OS Independent",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 2.6",
         "Programming Language :: Python :: 2.7",
-        "Programming Language :: Python :: 3.3",
         "Programming Language :: Python :: 3.4",
+        "Programming Language :: Python :: 3.5",
         "Topic :: Software Development :: Code Generators",
         "Topic :: Software Development :: Compilers",
       ],
       # Include the separately-compiled shared library
       author="Continuum Analytics, Inc.",
       author_email="numba-users@continuum.io",
-      url="https://github.com/numba/llvmlite",
+      url="http://llvmlite.pydata.org",
+      download_url="https://github.com/numba/llvmlite",
       packages=packages,
+      install_requires=install_requires,
       license="BSD",
       cmdclass=cmdclass,
       )

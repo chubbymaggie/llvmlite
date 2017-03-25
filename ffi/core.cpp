@@ -1,5 +1,6 @@
 #include "core.h"
-#include "llvm/Support/CommandLine.h"
+
+#include "llvm-c/Support.h"
 
 extern "C" {
 
@@ -31,9 +32,8 @@ LLVMPY_GetGlobalContext() {
 API_EXPORT(void)
 LLVMPY_SetCommandLine(const char *name, const char *option)
 {
-    const char * argv[] = {name, option};
-    llvm::cl::ParseCommandLineOptions(2, argv);
+    const char *argv[] = {name, option};
+    LLVMParseCommandLineOptions(2, argv, NULL);
 }
-
 
 } // end extern "C"

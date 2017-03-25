@@ -1,7 +1,7 @@
 #include <string>
+#include <clocale>
 #include "llvm-c/Core.h"
 #include "llvm-c/Analysis.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Module.h"
 #include "core.h"
 
@@ -80,17 +80,33 @@ API_EXPORT(void)
 LLVMPY_PrintModuleToString(LLVMModuleRef M,
                            const char **outstr)
 {
-    using namespace llvm;
-    std::string buf;
-    raw_string_ostream os(buf);
-    unwrap(M)->print(os, NULL);
-    os.flush();
-    *outstr = LLVMPY_CreateString(buf.c_str());
+    // Change the locale to en_US before calling LLVM to print the module
+    // due to a LLVM bug https://llvm.org/bugs/show_bug.cgi?id=12906
+    char *old_locale = strdup(setlocale(LC_ALL, NULL));
+    setlocale(LC_ALL, "C");
+
+    *outstr = LLVMPrintModuleToString(M);
+
+    // Revert locale
+    setlocale(LC_ALL, old_locale);
+    free(old_locale);
+}
+
+API_EXPORT(const char *)
+LLVMPY_GetModuleName(LLVMModuleRef M)
+{
+    return llvm::unwrap(M)->getModuleIdentifier().c_str();
+}
+
+API_EXPORT(void)
+LLVMPY_SetModuleName(LLVMModuleRef M, const char *Name)
+{
+    llvm::unwrap(M)->setModuleIdentifier(Name);
 }
 
 API_EXPORT(LLVMValueRef)
 LLVMPY_GetNamedFunction(LLVMModuleRef M,
-                     const char *Name)
+                        const char *Name)
 {
     return LLVMGetNamedFunction(M, Name);
 }
@@ -114,7 +130,7 @@ API_EXPORT(void)
 LLVMPY_GetDataLayout(LLVMModuleRef M,
                      const char **DL)
 {
-    *DL = LLVMGetDataLayout(M);
+    *DL = LLVMGetDataLayoutStr(M);
 }
 
 
@@ -201,5 +217,10 @@ LLVMPY_DisposeFunctionsIter(LLVMFunctionsIteratorRef GI)
     delete llvm::unwrap(GI);
 }
 
+API_EXPORT(LLVMModuleRef)
+LLVMPY_CloneModule(LLVMModuleRef M)
+{
+    return LLVMCloneModule(M);
+}
 
 } // end extern "C"

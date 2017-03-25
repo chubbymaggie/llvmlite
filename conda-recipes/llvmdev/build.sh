@@ -1,32 +1,34 @@
-if [ -z "$MACOSX_DEPLOYMENT_TARGET" ]; then
-    # Linux
-    ./configure \
-        --enable-pic \
-        --enable-optimized \
-        --disable-docs \
-        --enable-targets=host \
-        --disable-terminfo \
-        --disable-libedit \
-        --prefix=$PREFIX \
-        --with-python=$SYS_PYTHON
+CMAKE_COMMON_VARIABLES=" -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=host \
+    -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+    -DLLVM_INCLUDE_DOCS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ASSERTIONS=ON \
+    "
 
-else
-    # OSX needs 10.7 or above with libc++ enabled
+platform='unknown'
+unamestr="$(uname)"
+machine="$(uname -m)"
 
-    export MACOSX_DEPLOYMENT_TARGET=10.7
-    ./configure \
-        --enable-pic \
-        --enable-optimized \
-        --disable-docs \
-        --enable-targets=host \
-        --disable-terminfo \
-        --disable-libedit \
-        --prefix=$PREFIX \
-        --with-python=$SYS_PYTHON \
-        --enable-libcpp=yes
-
+if [[ "$unamestr" == 'Linux' ]]; then
+    platform='linux'
+elif [[ "$unamestr" == 'FreeBSD' ]]; then
+    platform='freebsd'
+elif [[ "$unamestr" == 'Darwin' ]]; then
+    platform='osx'
 fi
 
+# Note you may need to enable RH devtoolset-2 if building on an
+# old RH or CentOS system
 
-make -j4 libs-only
-make install-libs
+if [ -n "$MACOSX_DEPLOYMENT_TARGET" ]; then
+    # OSX needs 10.7 or above with libc++ enabled
+    export MACOSX_DEPLOYMENT_TARGET=10.9
+fi
+
+# Use CMake-based build procedure
+mkdir build
+cd build
+cmake $CMAKE_COMMON_VARIABLES ..
+
+make -j8
+make install

@@ -1,8 +1,9 @@
 #include <string>
 #include "llvm-c/Core.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/IR/Module.h"
 #include "core.h"
+
+// the following is needed for WriteGraph()
+#include "llvm/Analysis/CFGPrinter.h"
 
 extern "C" {
 
@@ -10,18 +11,7 @@ API_EXPORT(void)
 LLVMPY_PrintValueToString(LLVMValueRef Val,
                           const char** outstr)
 {
-    using namespace llvm;
-
-    std::string buf;
-    raw_string_ostream os(buf);
-
-    if (unwrap(Val))
-        unwrap(Val)->print(os);
-    else
-        os << "Printing <null> Value";
-
-    os.flush();
-    *outstr = LLVMPY_CreateString(buf.c_str());
+    *outstr = LLVMPrintValueToString(Val);
 }
 
 API_EXPORT(const char *)
@@ -61,9 +51,53 @@ LLVMPY_GetLinkage(LLVMValueRef Val)
 }
 
 API_EXPORT(void)
+LLVMPY_SetVisibility(LLVMValueRef Val, int Visibility)
+{
+    LLVMSetVisibility(Val, (LLVMVisibility)Visibility);
+}
+
+API_EXPORT(int)
+LLVMPY_GetVisibility(LLVMValueRef Val)
+{
+    return (int)LLVMGetVisibility(Val);
+}
+
+API_EXPORT(void)
+LLVMPY_SetDLLStorageClass(LLVMValueRef Val, int DLLStorageClass)
+{
+    LLVMSetDLLStorageClass(Val, (LLVMDLLStorageClass)DLLStorageClass);
+}
+
+API_EXPORT(int)
+LLVMPY_GetDLLStorageClass(LLVMValueRef Val)
+{
+    return (int)LLVMGetDLLStorageClass(Val);
+}
+
+API_EXPORT(void)
 LLVMPY_AddFunctionAttr(LLVMValueRef Fn, int Attr)
 {
     LLVMAddFunctionAttr(Fn, (LLVMAttribute)Attr);
+}
+
+API_EXPORT(int)
+LLVMPY_IsDeclaration(LLVMValueRef GV)
+{
+    return LLVMIsDeclaration(GV);
+}
+
+
+API_EXPORT(void)
+LLVMPY_WriteCFG(LLVMValueRef Fval, const char **OutStr, int ShowInst) {
+    using namespace llvm;
+    Function *F  = unwrap<Function>(Fval);
+    std::string buffer;
+    raw_string_ostream stream(buffer);
+    // Note: The (const Function*)F is necessary to trigger the right behavior.
+    //       A non constant Function* will result in the instruction not
+    //       printed regardless of the value in the 3rd argument.
+    WriteGraph(stream, (const Function*)F, !ShowInst);
+    *OutStr = LLVMPY_CreateString(stream.str().c_str());
 }
 
 
